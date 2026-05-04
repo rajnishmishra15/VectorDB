@@ -15,6 +15,7 @@
 #include <functional>
 #include <fstream>
 #include <climits>
+#include <filesystem>
 
 static const int DIMS = 16;   // demo vectors
 // Doc embeddings dimension is determined at runtime from Ollama's model output
@@ -341,6 +342,12 @@ class VectorDB {
     HNSW       hnsw;
     std::mutex mu;
     int nextId = 1;
+    // persistence helpers
+    void insertWithId(const VectorItem& v, DistFn dist) {
+        store[v.id] = v;
+        bf.insert(v); kdt.insert(v); hnsw.insert(v, dist);
+        if (v.id >= nextId) nextId = v.id + 1;
+    }
 
 public:
     const int dims;
@@ -425,6 +432,42 @@ public:
     size_t size() {
         std::lock_guard<std::mutex> lk(mu);
         return store.size();
+    }
+
+    bool saveToDir(const std::string& dir) {
+        try {
+            std::filesystem::create_directories(dir);
+            std::ofstream f(dir + "/vectors.dat", std::ios::binary);
+            if (!f) return false;
+            auto items = all();
+            int n = (int)items.size();
+            f.write((char*)&n, sizeof(int));
+            for (auto& v : items) {
+                f.write((char*)&v.id, sizeof(int));
+                int ml = (int)v.metadata.size(); f.write((char*)&ml, sizeof(int)); f.write(v.metadata.data(), ml);
+                int cl = (int)v.category.size(); f.write((char*)&cl, sizeof(int)); f.write(v.category.data(), cl);
+                int el = (int)v.emb.size(); f.write((char*)&el, sizeof(int));
+                f.write((char*)v.emb.data(), sizeof(float) * el);
+            }
+            return true;
+        } catch (...) { return false; }
+    }
+
+    bool loadFromDir(const std::string& dir, DistFn dist) {
+        try {
+            std::ifstream f(dir + "/vectors.dat", std::ios::binary);
+            if (!f) return false;
+            int n = 0; f.read((char*)&n, sizeof(int));
+            for (int i = 0; i < n; i++) {
+                VectorItem v; int ml=0, cl=0, el=0;
+                f.read((char*)&v.id, sizeof(int));
+                f.read((char*)&ml, sizeof(int)); v.metadata.resize(ml); f.read(&v.metadata[0], ml);
+                f.read((char*)&cl, sizeof(int)); v.category.resize(cl); f.read(&v.category[0], cl);
+                f.read((char*)&el, sizeof(int)); v.emb.resize(el); f.read((char*)v.emb.data(), sizeof(float)*el);
+                insertWithId(v, dist);
+            }
+            return true;
+        } catch (...) { return false; }
     }
 };
 
@@ -673,6 +716,16 @@ public:
         return item.id;
     }
 
+    // insert a pre-assigned id (used during load)
+    void insertWithId(const DocItem& item) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (dims == 0) dims = (int)item.emb.size();
+        store[item.id] = item;
+        VectorItem vi{item.id, item.title, "doc", item.emb};
+        hnsw.insert(vi, cosine); bf.insert(vi);
+        if (item.id >= nextId) nextId = item.id + 1;
+    }
+
     // Semantic search — returns top-k most similar chunks
     std::vector<std::pair<float, DocItem>> search(
         const std::vector<float>& q, int k, float max_dist = 0.7f)
@@ -708,6 +761,40 @@ public:
     }
 
     int getDims() { return dims; }
+
+    bool saveToDir(const std::string& dir) {
+        try {
+            std::filesystem::create_directories(dir);
+            std::ofstream f(dir + "/docs.dat", std::ios::binary);
+            if (!f) return false;
+            auto items = all();
+            int n = (int)items.size(); f.write((char*)&n, sizeof(int));
+            for (auto& it : items) {
+                f.write((char*)&it.id, sizeof(int));
+                int tl = (int)it.title.size(); f.write((char*)&tl, sizeof(int)); f.write(it.title.data(), tl);
+                int xl = (int)it.text.size();  f.write((char*)&xl, sizeof(int)); f.write(it.text.data(), xl);
+                int el = (int)it.emb.size();   f.write((char*)&el, sizeof(int)); f.write((char*)it.emb.data(), sizeof(float)*el);
+            }
+            return true;
+        } catch (...) { return false; }
+    }
+
+    bool loadFromDir(const std::string& dir) {
+        try {
+            std::ifstream f(dir + "/docs.dat", std::ios::binary);
+            if (!f) return false;
+            int n = 0; f.read((char*)&n, sizeof(int));
+            for (int i = 0; i < n; i++) {
+                DocItem it; int tl=0, xl=0, el=0;
+                f.read((char*)&it.id, sizeof(int));
+                f.read((char*)&tl, sizeof(int)); it.title.resize(tl); f.read(&it.title[0], tl);
+                f.read((char*)&xl, sizeof(int)); it.text.resize(xl);  f.read(&it.text[0], xl);
+                f.read((char*)&el, sizeof(int)); it.emb.resize(el);  f.read((char*)it.emb.data(), sizeof(float)*el);
+                insertWithId(it);
+            }
+            return true;
+        } catch (...) { return false; }
+    }
 };
 
 // =====================================================================
@@ -768,7 +855,10 @@ int main() {
     DocumentDB docDB;
     OllamaClient ollama;
 
-    loadDemo(db);
+    std::string dbDir = "./db";
+    bool loadedVectors = db.loadFromDir(dbDir, getDistFn("cosine"));
+    bool loadedDocs    = docDB.loadFromDir(dbDir);
+    if (!loadedVectors) loadDemo(db);
 
     // Check Ollama at startup (non-fatal)
     bool ollamaUp = ollama.isAvailable();
@@ -825,6 +915,7 @@ int main() {
             res.set_content("{\"error\":\"invalid body\"}", "application/json"); return;
         }
         int id = db.insert(meta, cat, emb, getDistFn("cosine"));
+        db.saveToDir(dbDir);
         res.set_content("{\"id\":" + std::to_string(id) + "}", "application/json");
     });
 
@@ -832,6 +923,7 @@ int main() {
         cors(res);
         int id  = std::stoi(req.matches[1]);
         bool ok = db.remove(id);
+        if (ok) db.saveToDir(dbDir);
         res.set_content("{\"ok\":" + std::string(ok ? "true" : "false") + "}",
                         "application/json");
     });
@@ -929,6 +1021,9 @@ int main() {
             ids.push_back(docDB.insert(chunkTitle, chunks[i], emb));
         }
 
+        // persist documents
+        docDB.saveToDir(dbDir);
+
         std::ostringstream ss;
         ss << "{\"ids\":[";
         for (size_t i = 0; i < ids.size(); i++) { if (i) ss << ','; ss << ids[i]; }
@@ -942,6 +1037,7 @@ int main() {
         cors(res);
         int id  = std::stoi(req.matches[1]);
         bool ok = docDB.remove(id);
+        if (ok) docDB.saveToDir(dbDir);
         res.set_content("{\"ok\":" + std::string(ok ? "true" : "false") + "}",
                         "application/json");
     });

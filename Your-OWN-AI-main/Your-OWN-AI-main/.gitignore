@@ -1,0 +1,9 @@
+db
+db.exe
+*.exe
+*.o
+*.obj
+*.dat
+tempCodeRunnerFile.cpp
+/.vscode/
+/.idea/
